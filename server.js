@@ -190,6 +190,30 @@ db.serialize(() => {
     tentativas INTEGER NOT NULL DEFAULT 0
   )`);
 
+  // Clientes da loja: nome de usuário, data de criação e códigos de verificação por e-mail
+  db.run(`ALTER TABLE clientes ADD COLUMN usuario TEXT`, () => {});
+  db.run(`ALTER TABLE clientes ADD COLUMN criado_em TEXT`, () => {});
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_clientes_usuario ON clientes(usuario COLLATE NOCASE)`);
+  db.run(`CREATE TABLE IF NOT EXISTS cliente_codigos (
+    email TEXT PRIMARY KEY,
+    tipo TEXT NOT NULL,
+    dados TEXT,
+    codigo_hash TEXT NOT NULL,
+    expira_em INTEGER NOT NULL,
+    tentativas INTEGER NOT NULL DEFAULT 0
+  )`);
+  // Contas antigas guardavam a senha em texto puro: converte para hash bcrypt
+  db.all(`SELECT id, senha FROM clientes`, [], async (err, rows) => {
+    if (err) return console.error('Erro na migração de senhas de clientes:', err.message);
+    try {
+      for (const c of rows) {
+        if (!String(c.senha).startsWith('$2')) {
+          await dbRun(`UPDATE clientes SET senha = ? WHERE id = ?`, [await bcrypt.hash(String(c.senha), 10), c.id]);
+        }
+      }
+    } catch (e) { console.error('Erro ao converter senhas de clientes:', e.message); }
+  });
+
   // Roda depois das migrações acima (o serialize garante a ordem)
   db.all(`SELECT id, usuario, senha, is_master FROM usuarios`, [], async (err, rows) => {
     if (err) return console.error('Erro na migração de senhas:', err.message);
@@ -562,53 +586,305 @@ app.get('/api/me', autenticarAdmin, async (req, res) => {
 });
 
 // ==========================================
-// ROTAS DE CLIENTES (CADASTRO / LOGIN)
+// ROTAS DE CLIENTES (CADASTRO / LOGIN COM CÓDIGO POR E-MAIL)
 // ==========================================
-app.post('/api/clientes/auth', (req, res) => {
-  const { email, senha } = req.body;
-  if (!email || !senha) return res.status(400).json({ error: 'E-mail e senha obrigatórios.' });
+const CODIGO_VALIDADE_MS = 10 * 60 * 1000;
+const normEmail = (e) => String(e || '').trim().toLowerCase();
 
-  db.get(`SELECT * FROM clientes WHERE email = ?`, [email], (err, cliente) => {
-    if (err) return res.status(500).json({ error: err.message });
+function mascararEmail(email) {
+  const [u, d] = email.split('@');
+  return `${u.slice(0, 2)}${'*'.repeat(Math.max(u.length - 2, 1))}@${d}`;
+}
 
-    if (!cliente) {
-      db.run(`INSERT INTO clientes (email, senha) VALUES (?, ?)`, [email, senha], function (err) {
-        if (err) return res.status(500).json({ error: err.message });
-        const token = jwt.sign({ id: this.lastID, email }, JWT_SECRET, { expiresIn: '30d' });
-        res.json({ token, email, message: 'Conta criada e login efetuado com sucesso!' });
-      });
-    } else {
-      if (cliente.senha !== senha) {
-        return res.status(401).json({ error: 'Senha incorreta.' });
-      }
-      const token = jwt.sign({ id: cliente.id, email: cliente.email }, JWT_SECRET, { expiresIn: '30d' });
-      res.json({ token, email: cliente.email, message: 'Login efetuado com sucesso!' });
-    }
+// Token de CLIENTE: tem "email" e "cliente", e NÃO tem "usuario" (por isso nunca passa como admin)
+function gerarTokenCliente(c) {
+  return jwt.sign({ id: c.id, email: c.email, cliente: true }, JWT_SECRET, { expiresIn: '30d' });
+}
+
+function autenticarCliente(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Faça login para continuar.' });
+  jwt.verify(token, JWT_SECRET, (err, u) => {
+    if (err || !u || !u.cliente || !u.email) return res.status(401).json({ error: 'Sessão expirada. Faça login novamente.' });
+    req.cliente = u;
+    next();
   });
-});
+}
 
-// ==========================================
-// PEDIDOS DO CLIENTE
-// ==========================================
-app.post('/api/pedidos', (req, res) => {
-  const { cliente_email, itens, subtotal, frete, total, data } = req.body;
-  if (!cliente_email || !itens) return res.status(400).json({ error: 'Dados do pedido incompletos.' });
-
-  const itensStr = JSON.stringify(itens);
-  db.run(
-    `INSERT INTO pedidos (cliente_email, itens, subtotal, frete, total, data, status) VALUES (?, ?, ?, ?, ?, ?, 'aberto')`,
-    [cliente_email, itensStr, subtotal, frete, total, data || new Date().toLocaleDateString('pt-BR')],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID, message: 'Pedido registrado com sucesso!' });
-    }
+// Gera um código de 6 dígitos, guarda só o hash e envia por e-mail. Retorna true/false.
+async function enviarCodigoCliente(email, tipo, dados, assunto, saudacao, texto) {
+  const codigo = String(crypto.randomInt(100000, 1000000));
+  await dbRun(
+    `INSERT OR REPLACE INTO cliente_codigos (email, tipo, dados, codigo_hash, expira_em, tentativas) VALUES (?, ?, ?, ?, ?, 0)`,
+    [email, tipo, dados ? JSON.stringify(dados) : null, hashToken(`${email}:${tipo}:${codigo}`), Date.now() + CODIGO_VALIDADE_MS]
   );
+  const enviado = await enviarEmail(email, assunto, `
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;color:#222">
+      <h2>${esc(saudacao)}</h2>
+      <p>${esc(texto)}</p>
+      <p style="font-size:32px;letter-spacing:8px;font-weight:bold;text-align:center;background:#f3effc;border-radius:12px;padding:14px 0">${codigo}</p>
+      <p style="font-size:13px;color:#555">O código vale por 10 minutos. Se você não pediu isso, ignore este e-mail.</p>
+    </div>`);
+  if (!enviado) await dbRun(`DELETE FROM cliente_codigos WHERE email = ?`, [email]);
+  return enviado;
+}
+
+// Confere o código. Retorna { erro } ou { row }.
+async function conferirCodigoCliente(email, tiposValidos, codigo) {
+  const invalido = { erro: 'Código inválido ou expirado. Peça um novo código.' };
+  const row = await dbGet(`SELECT * FROM cliente_codigos WHERE email = ?`, [email]);
+  if (!row || !tiposValidos.includes(row.tipo)) return invalido;
+  if (row.expira_em < Date.now()) {
+    await dbRun(`DELETE FROM cliente_codigos WHERE email = ?`, [email]);
+    return invalido;
+  }
+  if (row.tentativas >= 5) {
+    await dbRun(`DELETE FROM cliente_codigos WHERE email = ?`, [email]);
+    return { erro: 'Muitas tentativas incorretas. Peça um novo código.' };
+  }
+  const esperado = Buffer.from(row.codigo_hash, 'hex');
+  const recebido = Buffer.from(hashToken(`${email}:${row.tipo}:${codigo}`), 'hex');
+  if (esperado.length !== recebido.length || !crypto.timingSafeEqual(esperado, recebido)) {
+    await dbRun(`UPDATE cliente_codigos SET tentativas = tentativas + 1 WHERE email = ?`, [email]);
+    return { erro: 'Código incorreto.' };
+  }
+  return { row };
+}
+
+const ERRO_EMAIL_CODIGO = 'Não foi possível enviar o e-mail com o código. Confira o e-mail digitado e tente novamente.';
+
+// 1) Cadastro: valida, guarda os dados como "pendentes" e envia o código. A conta só nasce na confirmação.
+app.post('/api/clientes/cadastro', async (req, res) => {
+  try {
+    const usuario = String(req.body.usuario || '').trim();
+    const email = normEmail(req.body.email);
+    const { senha, senha_confirmacao } = req.body;
+
+    if (!limitar(`cli-cad-ip:${req.ip}`, 10, 60 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde um pouco e tente novamente.' });
+    }
+    if (!usuario || !email || !senha || !senha_confirmacao) return res.status(400).json({ error: 'Preencha todos os campos.' });
+    if (!validarEmail(email)) return res.status(400).json({ error: 'Informe um e-mail válido.' });
+    const eUsuario = validarNomeUsuario(usuario);
+    if (eUsuario) return res.status(400).json({ error: eUsuario });
+    if (senha !== senha_confirmacao) return res.status(400).json({ error: 'As senhas não conferem.' });
+    const eSenha = validarSenha(senha, usuario);
+    if (eSenha) return res.status(400).json({ error: eSenha });
+
+    if (await dbGet(`SELECT id FROM clientes WHERE LOWER(email) = ?`, [email])) {
+      return res.status(409).json({ error: 'Esse e-mail já está cadastrado. Tente entrar.' });
+    }
+    if (await dbGet(`SELECT id FROM clientes WHERE usuario = ? COLLATE NOCASE`, [usuario])) {
+      return res.status(409).json({ error: 'Esse nome de usuário já está em uso. Escolha outro.' });
+    }
+    if (!limitar(`cli-cod:${email}`, 5, 60 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Muitos códigos solicitados. Aguarde 1 hora e tente novamente.' });
+    }
+
+    const enviado = await enviarCodigoCliente(
+      email, 'cadastro', { usuario, senha_hash: await bcrypt.hash(senha, 10) },
+      'Seu código de verificação - Printae.gyn',
+      'Confirme seu e-mail',
+      `Olá, ${usuario}! Use o código abaixo para ativar sua conta na Printae.gyn:`
+    );
+    if (!enviado) return res.status(502).json({ error: ERRO_EMAIL_CODIGO });
+    res.json({ message: 'Código enviado!', email_mascarado: mascararEmail(email) });
+  } catch (e) {
+    console.error('Erro no cadastro de cliente:', e);
+    res.status(500).json({ error: 'Erro interno ao cadastrar. Tente novamente.' });
+  }
 });
 
-app.get('/api/pedidos/:email', (req, res) => {
-  db.all(`SELECT * FROM pedidos WHERE cliente_email = ? ORDER BY id DESC`, [req.params.email], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows.map(p => ({ ...p, itens: parseLista(p.itens) })));
+// 2) Login: confere a senha e envia um código por e-mail (a sessão só é criada em /verificar-email)
+app.post('/api/clientes/login', async (req, res) => {
+  try {
+    const email = normEmail(req.body.email);
+    const senha = String(req.body.senha || '');
+    if (!email || !senha) return res.status(400).json({ error: 'Informe e-mail e senha.' });
+    if (!limitar(`cli-login:${req.ip}:${email}`, 10, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde 15 minutos e tente novamente.' });
+    }
+
+    const c = await dbGet(`SELECT * FROM clientes WHERE LOWER(email) = ?`, [email]);
+    const senhaOk = await bcrypt.compare(senha, c ? c.senha : HASH_FALSO);
+    if (!c || !senhaOk) return res.status(401).json({ error: 'E-mail ou senha incorretos.' });
+
+    if (!limitar(`cli-cod:${email}`, 5, 60 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Muitos códigos solicitados. Aguarde 1 hora e tente novamente.' });
+    }
+    const enviado = await enviarCodigoCliente(
+      email, 'login', null,
+      'Seu código de acesso - Printae.gyn',
+      'Código de acesso',
+      `Olá${c.usuario ? ', ' + c.usuario : ''}! Use o código abaixo para entrar na sua conta:`
+    );
+    if (!enviado) return res.status(502).json({ error: ERRO_EMAIL_CODIGO });
+    res.json({ message: 'Código enviado!', email_mascarado: mascararEmail(email) });
+  } catch (e) {
+    console.error('Erro no login de cliente:', e);
+    res.status(500).json({ error: 'Erro interno ao entrar. Tente novamente.' });
+  }
+});
+
+// 3) Confirma o código (cadastro ou login) e devolve a sessão
+app.post('/api/clientes/verificar-email', async (req, res) => {
+  try {
+    const email = normEmail(req.body.email);
+    const codigo = String(req.body.codigo || '').trim();
+    if (!email || !/^\d{6}$/.test(codigo)) return res.status(400).json({ error: 'Digite o código de 6 dígitos.' });
+    if (!limitar(`cli-ver:${req.ip}:${email}`, 15, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
+    }
+
+    const { erro, row } = await conferirCodigoCliente(email, ['cadastro', 'login'], codigo);
+    if (erro) return res.status(400).json({ error: erro });
+
+    let cliente;
+    if (row.tipo === 'cadastro') {
+      const d = JSON.parse(row.dados || '{}');
+      try {
+        const r = await dbRun(
+          `INSERT INTO clientes (email, senha, usuario, criado_em) VALUES (?, ?, ?, ?)`,
+          [email, d.senha_hash, d.usuario, new Date().toISOString()]
+        );
+        cliente = { id: r.lastID, email, usuario: d.usuario };
+      } catch (e) {
+        if (/UNIQUE/i.test(e.message)) return res.status(409).json({ error: 'Esse e-mail ou usuário já está cadastrado. Tente entrar.' });
+        throw e;
+      }
+    } else {
+      cliente = await dbGet(`SELECT id, email, usuario FROM clientes WHERE LOWER(email) = ?`, [email]);
+      if (!cliente) return res.status(400).json({ error: 'Conta não encontrada.' });
+    }
+
+    await dbRun(`DELETE FROM cliente_codigos WHERE email = ?`, [email]);
+    res.json({ token: gerarTokenCliente(cliente), email: cliente.email, usuario: cliente.usuario || '' });
+  } catch (e) {
+    console.error('Erro ao verificar código de cliente:', e);
+    res.status(500).json({ error: 'Erro interno ao confirmar o código. Tente novamente.' });
+  }
+});
+
+// 4) Reenviar código (cadastro ou login pendente). Resposta sempre igual.
+app.post('/api/clientes/reenviar-codigo', async (req, res) => {
+  const resposta = { message: 'Se houver um código pendente para esse e-mail, enviamos um novo.' };
+  try {
+    const email = normEmail(req.body.email);
+    if (!email || !limitar(`cli-cod:${email}`, 5, 60 * 60 * 1000) || !limitar(`cli-reenv-ip:${req.ip}`, 15, 60 * 60 * 1000)) {
+      return res.json(resposta);
+    }
+    const row = await dbGet(`SELECT * FROM cliente_codigos WHERE email = ? AND tipo IN ('cadastro', 'login')`, [email]);
+    if (!row) return res.json(resposta);
+    const dados = row.dados ? JSON.parse(row.dados) : null;
+    await enviarCodigoCliente(
+      email, row.tipo, dados,
+      'Seu novo código - Printae.gyn',
+      row.tipo === 'cadastro' ? 'Confirme seu e-mail' : 'Código de acesso',
+      'Aqui está o seu novo código de verificação:'
+    );
+  } catch (e) {
+    console.error('Erro ao reenviar código:', e);
+  }
+  res.json(resposta);
+});
+
+// 5) Esqueci a senha: envia um código por e-mail. Resposta sempre igual (não revela quem tem conta).
+app.post('/api/clientes/esqueci-senha', async (req, res) => {
+  const resposta = { message: 'Se esse e-mail estiver cadastrado, você receberá um código em instantes.' };
+  try {
+    const email = normEmail(req.body.email);
+    if (!email || !limitar(`cli-esq-ip:${req.ip}`, 10, 60 * 60 * 1000) || !limitar(`cli-cod:${email}`, 5, 60 * 60 * 1000)) {
+      return res.json(resposta);
+    }
+    const c = await dbGet(`SELECT usuario FROM clientes WHERE LOWER(email) = ?`, [email]);
+    if (c) {
+      await enviarCodigoCliente(
+        email, 'reset', null,
+        'Redefinição de senha - Printae.gyn',
+        'Redefinir senha',
+        `Olá${c.usuario ? ', ' + c.usuario : ''}! Use o código abaixo para criar uma nova senha:`
+      );
+    }
+  } catch (e) {
+    console.error('Erro em esqueci-senha (cliente):', e);
+  }
+  res.json(resposta);
+});
+
+// 6) Redefinir a senha com o código recebido
+app.post('/api/clientes/redefinir-senha', async (req, res) => {
+  try {
+    const email = normEmail(req.body.email);
+    const codigo = String(req.body.codigo || '').trim();
+    const { senha_nova, senha_confirmacao } = req.body;
+    if (!email || !/^\d{6}$/.test(codigo)) return res.status(400).json({ error: 'Digite o código de 6 dígitos.' });
+    if (!limitar(`cli-red:${req.ip}:${email}`, 15, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde alguns minutos.' });
+    }
+    if (senha_nova !== senha_confirmacao) return res.status(400).json({ error: 'As senhas não conferem.' });
+
+    const c = await dbGet(`SELECT id, usuario FROM clientes WHERE LOWER(email) = ?`, [email]);
+    const eSenha = validarSenha(senha_nova, c && c.usuario);
+    if (eSenha) return res.status(400).json({ error: eSenha });
+
+    const { erro } = await conferirCodigoCliente(email, ['reset'], codigo);
+    if (erro || !c) return res.status(400).json({ error: erro || 'Código inválido ou expirado. Peça um novo código.' });
+
+    await dbRun(`UPDATE clientes SET senha = ? WHERE id = ?`, [await bcrypt.hash(senha_nova, 10), c.id]);
+    await dbRun(`DELETE FROM cliente_codigos WHERE email = ?`, [email]);
+    res.json({ message: 'Senha alterada com sucesso! Faça login com a nova senha.' });
+  } catch (e) {
+    console.error('Erro ao redefinir senha de cliente:', e);
+    res.status(500).json({ error: 'Erro interno ao redefinir a senha. Tente novamente.' });
+  }
+});
+
+// ==========================================
+// PEDIDOS DO CLIENTE (exigem login; o servidor recalcula preços e frete)
+// ==========================================
+const FRETE_GRATIS_A_PARTIR_DE = 199;
+const VALOR_FRETE = 15.9;
+
+app.post('/api/pedidos', autenticarCliente, async (req, res) => {
+  try {
+    const itens = req.body.itens;
+    if (!Array.isArray(itens) || itens.length === 0 || itens.length > 50) {
+      return res.status(400).json({ error: 'Carrinho vazio ou inválido.' });
+    }
+    const itensFinal = [];
+    let subtotal = 0;
+    for (const it of itens) {
+      const nome = it && typeof it.name === 'string' ? it.name : '';
+      const qtd = Number(it && it.quantity);
+      if (!nome || !Number.isInteger(qtd) || qtd < 1 || qtd > 99) {
+        return res.status(400).json({ error: 'Item do carrinho inválido.' });
+      }
+      const prod = await dbGet(`SELECT nome, preco FROM produtos WHERE nome = ?`, [nome]);
+      if (!prod) return res.status(400).json({ error: `O produto "${nome}" não está mais disponível. Atualize a página.` });
+      subtotal += prod.preco * qtd;
+      itensFinal.push({ name: prod.nome, quantity: qtd, price: prod.preco });
+    }
+    subtotal = Math.round(subtotal * 100) / 100;
+    const frete = subtotal >= FRETE_GRATIS_A_PARTIR_DE ? 0 : VALOR_FRETE;
+    const total = Math.round((subtotal + frete) * 100) / 100;
+    const data = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+    const r = await dbRun(
+      `INSERT INTO pedidos (cliente_email, itens, subtotal, frete, total, data, status) VALUES (?, ?, ?, ?, ?, ?, 'aberto')`,
+      [req.cliente.email, JSON.stringify(itensFinal), subtotal, frete, total, data]
+    );
+    res.json({ id: r.lastID, total, message: 'Pedido registrado com sucesso!' });
+  } catch (e) {
+    console.error('Erro ao registrar pedido:', e);
+    res.status(500).json({ error: 'Não foi possível registrar o pedido.' });
+  }
+});
+
+app.get('/api/pedidos/meus', autenticarCliente, (req, res) => {
+  db.all(`SELECT * FROM pedidos WHERE LOWER(cliente_email) = ? ORDER BY id DESC`, [normEmail(req.cliente.email)], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Não foi possível carregar os pedidos.' });
+    res.json(rows.map(p => ({ ...p, status: p.status || 'aberto', itens: parseLista(p.itens) })));
   });
 });
 
