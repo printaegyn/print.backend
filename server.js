@@ -6,10 +6,38 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
 const app = express();
-const JWT_SECRET = process.env.JWT_SECRET || 'printae_secret_key_2026';
+
+// O segredo dos logins NÃO tem valor padrão: sem ele, o servidor se recusa a iniciar.
+// (um padrão no código seria público e permitiria forjar logins de administrador)
+const JWT_SECRET = String(process.env.JWT_SECRET || '').trim();
+if (JWT_SECRET.length < 16) {
+  console.error('ERRO FATAL: defina a variável JWT_SECRET no Render com pelo menos 16 caracteres (recomendado: 32 ou mais, aleatórios).');
+  process.exit(1);
+}
+if (JWT_SECRET.length < 32) {
+  console.warn('AVISO: JWT_SECRET curto. Use 32 caracteres ou mais, aleatórios.');
+}
 
 app.set('trust proxy', 1); // Render fica atrás de proxy: necessário para o IP real (limite de tentativas)
-app.use(cors());
+
+// CORS: só os sites listados em ALLOWED_ORIGINS (separados por vírgula) podem chamar a API pelo navegador.
+// Ex.: ALLOWED_ORIGINS=https://printae-projeto.vercel.app
+const ORIGENS_PERMITIDAS = String(process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+if (ORIGENS_PERMITIDAS.length === 0) {
+  console.warn('AVISO: ALLOWED_ORIGINS vazio — nenhum site de navegador conseguirá usar a API. Defina o endereço do site no Render.');
+} else {
+  console.log(`CORS liberado para: ${ORIGENS_PERMITIDAS.join(', ')}`);
+}
+app.use(cors({
+  origin(origin, callback) {
+    // Sem "origin" = chamadas fora do navegador (ex.: avisos do Mercado Pago, testes por link): não usam CORS.
+    if (!origin) return callback(null, true);
+    callback(null, ORIGENS_PERMITIDAS.includes(origin.replace(/\/+$/, '')));
+  }
+}));
 app.use(express.json({ limit: '50mb' }));
 
 const db = new sqlite3.Database('./database.db', (err) => {
@@ -1061,29 +1089,81 @@ app.delete('/api/produtos/:id', ...exigirPermissao('remover_produtos'), (req, re
 });
 
 // ==========================================
-// CARGOS (somente master cria/edita; quem gerencia usuários pode LISTAR para escolher)
+// CARGOS
+//  - listar: quem gerencia usuários ou cargos (para escolher o cargo)
+//  - criar: "adicionar_cargos"  | editar: "editar_cargos"  | master sempre pode
+//  - quem não é master só concede permissões que ele mesmo possui (sem escalar privilégio)
 // ==========================================
-app.get('/api/cargos', ...exigirPermissao('adicionar_admin', 'editar_admin'), (req, res) => {
+const PERMISSOES_CONHECIDAS = new Set([
+  'adicionar_produtos', 'remover_produtos', 'editar_produtos',
+  'adicionar_categorias', 'remover_categorias', 'editar_categorias',
+  'ver_pedidos', 'finalizar_pedidos', 'cancelar_pedidos',
+  'adicionar_banners', 'remover_banners',
+  'adicionar_admin', 'remover_admin', 'editar_admin', 'alterar_senha_admin',
+  'adicionar_cargos', 'editar_cargos',
+  'alterar_logo', 'alterar_textos'
+]);
+
+// Retorna { lista } ou { erro, status }
+function validarPermissoesCargo(permissoes, admin) {
+  const lista = [...new Set(Array.isArray(permissoes) ? permissoes.map(String) : [])];
+  const desconhecida = lista.find(p => !PERMISSOES_CONHECIDAS.has(p));
+  if (desconhecida) return { erro: `Permissão inválida: ${desconhecida}`, status: 400 };
+  if (!admin.is_master) {
+    const minhas = new Set(admin.permissoes);
+    if (lista.some(p => !minhas.has(p))) {
+      return { erro: 'Você não pode conceder permissões que você mesmo não possui.', status: 403 };
+    }
+  }
+  return { lista };
+}
+
+app.get('/api/cargos', ...exigirPermissao('adicionar_admin', 'editar_admin', 'adicionar_cargos', 'editar_cargos'), (req, res) => {
   db.all(`SELECT * FROM cargos ORDER BY nome ASC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json(rows.map(r => ({ ...r, permissoes: parseLista(r.permissoes) })));
   });
 });
 
-app.post('/api/cargos', ...exigirPermissao(), (req, res) => {
-  const { nome, permissoes } = req.body;
-  db.run(`INSERT INTO cargos (nome, permissoes) VALUES (?, ?)`, [nome, JSON.stringify(permissoes || [])], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ id: this.lastID, message: 'Cargo criado!' });
-  });
+app.post('/api/cargos', ...exigirPermissao('adicionar_cargos'), async (req, res) => {
+  try {
+    const nome = String(req.body.nome || '').trim();
+    if (!nome || nome.length > 60) return res.status(400).json({ error: 'Informe o nome do cargo (até 60 caracteres).' });
+    const v = validarPermissoesCargo(req.body.permissoes, req.admin);
+    if (v.erro) return res.status(v.status).json({ error: v.erro });
+
+    const r = await dbRun(`INSERT INTO cargos (nome, permissoes) VALUES (?, ?)`, [nome, JSON.stringify(v.lista)]);
+    res.json({ id: r.lastID, message: 'Cargo criado!' });
+  } catch (e) {
+    if (/UNIQUE/i.test(e.message)) return res.status(409).json({ error: 'Já existe um cargo com esse nome.' });
+    res.status(500).json({ error: 'Não foi possível criar o cargo.' });
+  }
 });
 
-app.put('/api/cargos/:id', ...exigirPermissao(), (req, res) => {
-  const { nome, permissoes } = req.body;
-  db.run(`UPDATE cargos SET nome = ?, permissoes = ? WHERE id = ?`, [nome, JSON.stringify(permissoes || []), req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
+app.put('/api/cargos/:id', ...exigirPermissao('editar_cargos'), async (req, res) => {
+  try {
+    const nome = String(req.body.nome || '').trim();
+    if (!nome || nome.length > 60) return res.status(400).json({ error: 'Informe o nome do cargo (até 60 caracteres).' });
+
+    const cargo = await dbGet(`SELECT id, permissoes FROM cargos WHERE id = ?`, [req.params.id]);
+    if (!cargo) return res.status(404).json({ error: 'Cargo não encontrado.' });
+
+    // Não master: não mexe em cargo que tem permissões acima das dele
+    if (!req.admin.is_master) {
+      const minhas = new Set(req.admin.permissoes);
+      if (parseLista(cargo.permissoes).some(p => !minhas.has(p))) {
+        return res.status(403).json({ error: 'Você não pode editar um cargo com permissões que você mesmo não possui.' });
+      }
+    }
+    const v = validarPermissoesCargo(req.body.permissoes, req.admin);
+    if (v.erro) return res.status(v.status).json({ error: v.erro });
+
+    await dbRun(`UPDATE cargos SET nome = ?, permissoes = ? WHERE id = ?`, [nome, JSON.stringify(v.lista), cargo.id]);
     res.json({ message: 'Cargo atualizado com sucesso!' });
-  });
+  } catch (e) {
+    if (/UNIQUE/i.test(e.message)) return res.status(409).json({ error: 'Já existe um cargo com esse nome.' });
+    res.status(500).json({ error: 'Não foi possível atualizar o cargo.' });
+  }
 });
 
 // ==========================================
