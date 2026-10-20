@@ -2,6 +2,7 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const compression = require('compression');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
@@ -31,6 +32,7 @@ if (ORIGENS_PERMITIDAS.length === 0) {
 } else {
   console.log(`CORS liberado para: ${ORIGENS_PERMITIDAS.join(', ')}`);
 }
+app.use(compression()); // respostas de texto/JSON vão compactadas
 app.use(cors({
   origin(origin, callback) {
     // Sem "origin" = chamadas fora do navegador (ex.: avisos do Mercado Pago, testes por link): não usam CORS.
@@ -160,6 +162,7 @@ db.serialize(() => {
     imagem TEXT,
     imagens TEXT
   )`);
+  db.run(`ALTER TABLE produtos ADD COLUMN miniatura TEXT`, () => {});
 
   db.run(`CREATE TABLE IF NOT EXISTS cargos (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1044,21 +1047,72 @@ app.delete('/api/categorias/:id', ...exigirPermissao('remover_categorias'), (req
 // ==========================================
 // PRODUTOS
 // ==========================================
+// Produtos: a LISTA é leve (sem fotos dentro). Cada foto sai por um endereço próprio,
+// carrega só quando aparece na tela e fica em cache no navegador.
+const baseApi = (req) => `${req.protocol}://${req.get('host')}/api`;
+const fotoUrl = (req, id, i, v) => `${baseApi(req)}/produtos/${id}/foto?${i === null ? '' : 'i=' + i + '&'}v=${v}`;
+function galeriaDe(row) {
+  let g = [];
+  try { g = typeof row.imagens === 'string' ? JSON.parse(row.imagens) : (row.imagens || []); } catch (e) {}
+  g = Array.isArray(g) ? g.filter(x => typeof x === 'string' && x) : [];
+  if (row.imagem && !g.includes(row.imagem)) g.unshift(row.imagem);
+  return g;
+}
+const miniaturaValida = (m) => (typeof m === 'string' && /^data:image\/(jpeg|png|webp);base64,/.test(m) && m.length < 400000) ? m : '';
+
 app.get('/api/produtos', (req, res) => {
-  db.all(`SELECT * FROM produtos ORDER BY id DESC`, [], (err, rows) => {
+  db.all(
+    `SELECT id, nome, preco, categoria, descricao,
+            length(COALESCE(NULLIF(miniatura, ''), imagem)) AS v,
+            (imagem IS NOT NULL AND imagem != '') AS tem_foto
+     FROM produtos ORDER BY id DESC`, [], (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+    res.json(rows.map(r => ({
+      id: r.id, nome: r.nome, preco: r.preco, categoria: r.categoria, descricao: r.descricao,
+      imagem: r.tem_foto ? fotoUrl(req, r.id, null, r.v) : ''
+    })));
+  });
+});
+
+// Um produto: fotos como endereços (padrão) ou em base64 (?completo=1, usado pelo painel ao editar)
+app.get('/api/produtos/:id', (req, res) => {
+  db.get(`SELECT * FROM produtos WHERE id = ?`, [req.params.id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: 'Produto não encontrado.' });
+    const g = galeriaDe(row);
+    const base = { id: row.id, nome: row.nome, preco: row.preco, categoria: row.categoria, descricao: row.descricao };
+    if (req.query.completo === '1') return res.json({ ...base, imagem: row.imagem || '', imagens: g });
+    const urls = g.map((f, k) => fotoUrl(req, row.id, k, f.length));
+    const k = row.imagem ? g.indexOf(row.imagem) : -1;
+    res.json({ ...base, imagem: k >= 0 ? urls[k] : '', imagens: urls });
+  });
+});
+
+// Foto como arquivo de imagem: sem ?i = miniatura (ou foto principal); com ?i=N = foto N da galeria
+app.get('/api/produtos/:id/foto', (req, res) => {
+  db.get(`SELECT imagem, imagens, miniatura FROM produtos WHERE id = ?`, [req.params.id], (err, row) => {
+    if (err || !row) return res.status(404).end();
+    const dado = req.query.i === undefined
+      ? (row.miniatura || row.imagem || '')
+      : (galeriaDe(row)[Number(req.query.i)] || '');
+    const m = /^data:(image\/(?:jpeg|png|webp|gif));base64,(.*)$/s.exec(dado);
+    if (m) {
+      res.set({ 'Content-Type': m[1], 'Cache-Control': 'public, max-age=2592000', 'X-Content-Type-Options': 'nosniff' });
+      return res.send(Buffer.from(m[2], 'base64'));
+    }
+    if (/^https?:\/\//.test(dado)) return res.redirect(302, dado);
+    res.status(404).end();
   });
 });
 
 app.post('/api/produtos', ...exigirPermissao('adicionar_produtos'), (req, res) => {
-  const { nome, preco, categoria, descricao, imagem, imagens } = req.body;
+  const { nome, preco, categoria, descricao, imagem, imagens, miniatura } = req.body;
   const imagensJson = Array.isArray(imagens) ? JSON.stringify(imagens) : JSON.stringify([imagem || '']);
   const imagemPrincipal = imagem || (Array.isArray(imagens) && imagens[0]) || '';
 
   db.run(
-    `INSERT INTO produtos (nome, preco, categoria, descricao, imagem, imagens) VALUES (?, ?, ?, ?, ?, ?)`,
-    [nome, preco, categoria, descricao, imagemPrincipal, imagensJson],
+    `INSERT INTO produtos (nome, preco, categoria, descricao, imagem, imagens, miniatura) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [nome, preco, categoria, descricao, imagemPrincipal, imagensJson, miniaturaValida(miniatura)],
     function (err) {
       if (err) return res.status(500).json({ error: err.message });
       res.json({ id: this.lastID, message: 'Produto cadastrado!' });
@@ -1067,13 +1121,13 @@ app.post('/api/produtos', ...exigirPermissao('adicionar_produtos'), (req, res) =
 });
 
 app.put('/api/produtos/:id', ...exigirPermissao('editar_produtos'), (req, res) => {
-  const { nome, preco, categoria, descricao, imagem, imagens } = req.body;
+  const { nome, preco, categoria, descricao, imagem, imagens, miniatura } = req.body;
   const imagensJson = Array.isArray(imagens) ? JSON.stringify(imagens) : JSON.stringify([imagem || '']);
   const imagemPrincipal = imagem || (Array.isArray(imagens) && imagens[0]) || '';
 
   db.run(
-    `UPDATE produtos SET nome = ?, preco = ?, categoria = ?, descricao = ?, imagem = ?, imagens = ? WHERE id = ?`,
-    [nome, preco, categoria, descricao, imagemPrincipal, imagensJson, req.params.id],
+    `UPDATE produtos SET nome = ?, preco = ?, categoria = ?, descricao = ?, imagem = ?, imagens = ?, miniatura = ? WHERE id = ?`,
+    [nome, preco, categoria, descricao, imagemPrincipal, imagensJson, miniaturaValida(miniatura), req.params.id],
     (err) => {
       if (err) return res.status(500).json({ error: err.message });
       res.json({ message: 'Produto atualizado!' });
